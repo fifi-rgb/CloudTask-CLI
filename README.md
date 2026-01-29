@@ -2,6 +2,13 @@
 
 A lightweight command-line task manager with local SQLite storage and powerful query capabilities.
 
+## Notes
+This project was built as an exploratory learning exercise to understand how to design
+Python CLI tools and orchestrate cloud-related tasks. If revisiting it today, I would:
+- add tests and CI
+- improve configuration management
+- extend it to support async workflows
+
 ## Features
 
 - **Local Storage**: All tasks stored in SQLite database (no cloud required)
