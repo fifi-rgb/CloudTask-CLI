@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
 """
 CloudTask CLI - A Professional Task Management System with Cloud Sync
-
-This CLI demonstrates advanced Python patterns including:
-- Custom decorator-based command framework
-- Type hints and modern Python 3.9+ features
-- REST API client with retry logic and exponential backoff
-- Query DSL for complex filtering
-- Threading/concurrency for batch operations
-- Configuration management with XDG directories
-- Caching mechanisms
-- Exception handling and validation
-
-Author: Portfolio Project
-License: MIT
 """
 
 import argparse
