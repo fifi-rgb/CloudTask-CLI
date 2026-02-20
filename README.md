@@ -1,10 +1,6 @@
-# CloudTask CLI - Professional Task Management System
+# CloudTask CLI
 
-A sophisticated command-line interface demonstrating **advanced Python programming patterns** and **production-grade software engineering practices**.
-
-## 🎯 Purpose
-
-This project showcases professional Python development skills through a clean, well-architected CLI application. While the Vast CLI is proprietary, this project demonstrates the same advanced patterns and technical expertise in a standalone portfolio piece.
+A lightweight command-line task manager with local SQLite storage and powerful query capabilities.
 
 ## ✨ Key Features Demonstrated
 
