@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
-CloudTask CLI - A command-line task management system with SQLite storage.
-
-A lightweight CLI for managing tasks locally with support for:
-- Complex query filtering
-- Batch operations
-- Tag-based organization
-- Priority management
-
-Author: Phoebe Chau
-License: MIT
+CloudTask CLI - A Professional Task Management System with Cloud Sync
 """
 
 import argparse
@@ -18,20 +9,33 @@ import os
 import re
 import sys
 import time
-import sqlite3
-import logging
+import shutil
+import importlib.metadata
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote_plus
 import subprocess
 
-# Application directories
-DIRS = {
-    'config': os.path.join(os.path.expanduser('~'), '.config'),
-    'cache': os.path.join(os.path.expanduser('~'), '.cache'),
-    'data': os.path.join(os.path.expanduser('~'), '.local', 'share'),
-}
+try:
+    import requests
+except ImportError:
+    print("Error: 'requests' library required. Install with: pip install requests")
+    sys.exit(1)
+
+try:
+    import xdg
+    DIRS = {
+        'config': xdg.xdg_config_home(),
+        'cache': xdg.xdg_cache_home()
+    }
+except ImportError:
+    # Reasonable defaults for systems without xdg
+    DIRS = {
+        'config': os.path.join(os.path.expanduser('~'), '.config'),
+        'cache': os.path.join(os.path.expanduser('~'), '.cache'),
+    }
 
 # Initialize application directories
 APP_NAME = "cloudtask"
@@ -42,21 +46,13 @@ for key in DIRS.keys():
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
 
+API_KEY_FILE = os.path.join(DIRS['config'], "api_key")
 CONFIG_FILE = os.path.join(DIRS['config'], "config.json")
-DB_FILE = os.path.join(DIRS['data'], "tasks.db")
+CACHE_FILE = os.path.join(DIRS['cache'], "task_cache.json")
+CACHE_DURATION = timedelta(minutes=15)
 
-# Setup logging
-LOG_FILE = os.path.join(DIRS['cache'], "cloudtask.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stderr)
-    ]
-)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)  # Only show warnings/errors to stderr by default
+# Default API endpoint
+API_BASE_URL = os.getenv("CLOUDTASK_URL", "https://api.cloudtask.example.com")
 
 
 # ============================================================================
@@ -98,7 +94,12 @@ class CustomHelpFormatter(argparse.RawTextHelpFormatter):
 
 
 class CommandParserWrapper:
-    """Argument parser wrapper enabling decorator-based command registration."""
+    """
+    Custom argument parser wrapper that enables decorator-based command registration.
+    
+    This pattern allows for clean, maintainable CLI command definitions using
+    Python decorators rather than imperative parser configuration.
+    """
     
     def __init__(self, *args, **kwargs):
         if "formatter_class" not in kwargs:
@@ -121,13 +122,7 @@ class CommandParserWrapper:
         """Add global argument available to all subcommands"""
         parent_only = kwargs.pop("parent_only", False)
         
-        # Store global args to add to future subparsers
         if not parent_only:
-            if not hasattr(self, '_global_args'):
-                self._global_args = []
-            self._global_args.append((args, kwargs.copy()))
-            
-            # Add to existing subparsers
             for subparser in self.subparser_objs:
                 try:
                     if not hasattr(subparser, '_global_options_group'):
@@ -161,7 +156,18 @@ class CommandParserWrapper:
             return verb
 
     def command(self, *arguments, aliases: Tuple[str, ...] = (), help: Optional[str] = None, **kwargs):
-        """Decorator for registering CLI commands."""
+        """
+        Decorator for registering CLI commands.
+        
+        Usage:
+            @parser.command(
+                argument("--name", help="Task name", required=True),
+                help="Create a new task"
+            )
+            def create__task(args):
+                # Implementation here
+                pass
+        """
         help_text = help
         
         def decorator(func):
@@ -187,21 +193,6 @@ class CommandParserWrapper:
             )
             
             self.subparser_objs.append(subparser)
-            
-            # Add any global args that were defined before this command
-            if hasattr(self, '_global_args'):
-                if not hasattr(subparser, '_global_options_group'):
-                    subparser._global_options_group = subparser.add_argument_group(
-                        'Global options (available for all commands)'
-                    )
-                for arg_args, arg_kwargs in self._global_args:
-                    try:
-                        subparser_kwargs = arg_kwargs.copy()
-                        subparser_kwargs['default'] = argparse.SUPPRESS
-                        subparser._global_options_group.add_argument(*arg_args, **subparser_kwargs)
-                    except argparse.ArgumentError:
-                        pass  # Argument already exists
-            
             self._process_arguments_with_groups(subparser, arguments)
             subparser.set_defaults(func=func)
             
@@ -266,207 +257,110 @@ class CommandParserWrapper:
 
 
 # ============================================================================
-# DATABASE BACKEND
+# API CLIENT LAYER
 # ============================================================================
 
-class SQLiteBackend:
-    """SQLite database backend for task storage."""
+class APIClient:
+    """
+    REST API client with retry logic, exponential backoff, and authentication.
     
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._init_database()
+    Demonstrates:
+    - HTTP request handling with proper error management
+    - Retry logic with exponential backoff
+    - Bearer token authentication
+    - JSON serialization/deserialization
+    """
     
-    def _init_database(self):
-        """Initialize database schema if it doesn't exist."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS tasks (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        title TEXT NOT NULL,
-                        description TEXT,
-                        status TEXT DEFAULT 'pending',
-                        priority INTEGER DEFAULT 5,
-                        tags TEXT,
-                        created REAL NOT NULL,
-                        updated REAL NOT NULL,
-                        due_date REAL,
-                        assigned_to TEXT,
-                        project TEXT
-                    )
-                ''')
-                conn.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_status ON tasks(status)
-                ''')
-                conn.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_priority ON tasks(priority)
-                ''')
-                conn.commit()
-                logger.info(f"Database initialized at {self.db_path}")
-        except sqlite3.Error as e:
-            logger.error(f"Failed to initialize database: {e}")
-            raise CloudTaskException(f"Database initialization failed: {e}")
-    
-    def _row_to_dict(self, row: sqlite3.Row) -> Dict:
-        """Convert SQLite row to dictionary."""
-        task = dict(row)
-        if task.get('tags'):
-            task['tags'] = json.loads(task['tags'])
-        return task
-    
-    def create_task(self, task_data: Dict) -> Dict:
-        """Create a new task."""
-        now = time.time()
-        task_data['created'] = now
-        task_data['updated'] = now
+    def __init__(self, base_url: str, api_key: Optional[str] = None, 
+                 max_retries: int = 3, timeout: int = 30):
+        self.base_url = base_url.rstrip('/')
+        self.api_key = api_key
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.session = requests.Session()
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Generate request headers with authentication"""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _request(self, method: str, endpoint: str, 
+                 params: Optional[Dict] = None, 
+                 json_data: Optional[Dict] = None) -> requests.Response:
+        """
+        Make HTTP request with retry logic and exponential backoff.
         
-        if 'tags' in task_data and isinstance(task_data['tags'], list):
-            task_data['tags'] = json.dumps(task_data['tags'])
-        
-        fields = ', '.join(task_data.keys())
-        placeholders = ', '.join(['?' for _ in task_data])
-        
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.execute(
-                    f'INSERT INTO tasks ({fields}) VALUES ({placeholders})',
-                    list(task_data.values())
-                )
-                task_id = cursor.lastrowid
-                conn.commit()
-                logger.info(f"Created task {task_id}: {task_data.get('title')}")
-                
-                row = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
-                return self._row_to_dict(row)
-        except sqlite3.Error as e:
-            logger.error(f"Failed to create task: {e}")
-            raise CloudTaskException(f"Failed to create task: {e}")
-    
-    def search_tasks(self, query: Dict) -> List[Dict]:
-        """Search tasks based on query filters."""
-        where_clauses = []
-        params = []
-        
-        for field, conditions in query.items():
-            if field in ['order', 'limit']:
-                continue
+        Args:
+            method: HTTP method (GET, POST, PUT, DELETE)
+            endpoint: API endpoint path
+            params: Query parameters
+            json_data: JSON request body
             
-            if not isinstance(conditions, dict):
-                continue
+        Returns:
+            Response object
             
-            for op, value in conditions.items():
-                if op == 'eq':
-                    where_clauses.append(f"{field} = ?")
-                    params.append(value)
-                elif op == 'neq':
-                    where_clauses.append(f"{field} != ?")
-                    params.append(value)
-                elif op == 'gt':
-                    where_clauses.append(f"{field} > ?")
-                    params.append(value)
-                elif op == 'gte':
-                    where_clauses.append(f"{field} >= ?")
-                    params.append(value)
-                elif op == 'lt':
-                    where_clauses.append(f"{field} < ?")
-                    params.append(value)
-                elif op == 'lte':
-                    where_clauses.append(f"{field} <= ?")
-                    params.append(value)
-                elif op == 'in':
-                    if field == 'tags':
-                        # Special handling for tags stored as JSON
-                        tag_conditions = []
-                        for tag in value:
-                            where_clauses.append(f"tags LIKE ?")
-                            params.append(f'%"{tag}"%')
-                    else:
-                        placeholders = ','.join(['?' for _ in value])
-                        where_clauses.append(f"{field} IN ({placeholders})")
-                        params.extend(value)
-                elif op == 'notin':
-                    placeholders = ','.join(['?' for _ in value])
-                    where_clauses.append(f"{field} NOT IN ({placeholders})")
-                    params.extend(value)
+        Raises:
+            CloudTaskException: On request failure after all retries
+        """
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        headers = self._get_headers()
         
-        where_sql = ' AND '.join(where_clauses) if where_clauses else '1=1'
+        backoff_time = 0.25
+        last_exception = None
         
-        order_by = 'priority DESC, created DESC'
-        if 'order' in query and query['order']:
-            order_parts = []
-            for field, direction in query['order']:
-                order_parts.append(f"{field} {direction.upper()}")
-            order_by = ', '.join(order_parts)
-        
-        limit = query.get('limit', 100)
-        
-        sql = f'SELECT * FROM tasks WHERE {where_sql} ORDER BY {order_by} LIMIT ?'
-        params.append(limit)
-        
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(sql, params).fetchall()
-                logger.debug(f"Search returned {len(rows)} tasks")
-                return [self._row_to_dict(row) for row in rows]
-        except sqlite3.Error as e:
-            logger.error(f"Search failed: {e}")
-            raise CloudTaskException(f"Search failed: {e}")
-    
-    def update_task(self, task_id: int, updates: Dict) -> Dict:
-        """Update an existing task."""
-        updates['updated'] = time.time()
-        
-        if 'tags' in updates and isinstance(updates['tags'], list):
-            updates['tags'] = json.dumps(updates['tags'])
-        
-        set_clause = ', '.join([f"{k} = ?" for k in updates.keys()])
-        
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.execute(
-                    f'UPDATE tasks SET {set_clause} WHERE id = ?',
-                    list(updates.values()) + [task_id]
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_data,
+                    timeout=self.timeout
                 )
-                if cursor.rowcount == 0:
-                    raise CloudTaskException(f"Task {task_id} not found")
-                conn.commit()
-                logger.info(f"Updated task {task_id}")
                 
-                row = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
-                return self._row_to_dict(row)
-        except sqlite3.Error as e:
-            logger.error(f"Failed to update task {task_id}: {e}")
-            raise CloudTaskException(f"Failed to update task: {e}")
-    
-    def delete_task(self, task_id: int) -> bool:
-        """Delete a task."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
-                if cursor.rowcount == 0:
-                    raise CloudTaskException(f"Task {task_id} not found")
-                conn.commit()
-                logger.info(f"Deleted task {task_id}")
-                return True
-        except sqlite3.Error as e:
-            logger.error(f"Failed to delete task {task_id}: {e}")
-            raise CloudTaskException(f"Failed to delete task: {e}")
-    
-    def get_task(self, task_id: int) -> Optional[Dict]:
-        """Get a single task by ID."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
-                if row:
-                    return self._row_to_dict(row)
-                return None
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get task {task_id}: {e}")
-            raise CloudTaskException(f"Failed to get task: {e}")
+                # Handle rate limiting with exponential backoff
+                if response.status_code == 429:
+                    if attempt < self.max_retries - 1:
+                        time.sleep(backoff_time)
+                        backoff_time *= 1.5
+                        continue
+                
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    time.sleep(backoff_time)
+                    backoff_time *= 1.5
+                    continue
+        
+        raise CloudTaskException(
+            f"Request failed after {self.max_retries} attempts: {last_exception}"
+        )
+
+    def get(self, endpoint: str, params: Optional[Dict] = None) -> Dict:
+        """Make GET request"""
+        response = self._request("GET", endpoint, params=params)
+        return response.json() if response.content else {}
+
+    def post(self, endpoint: str, json_data: Optional[Dict] = None) -> Dict:
+        """Make POST request"""
+        response = self._request("POST", endpoint, json_data=json_data)
+        return response.json() if response.content else {}
+
+    def put(self, endpoint: str, json_data: Optional[Dict] = None) -> Dict:
+        """Make PUT request"""
+        response = self._request("PUT", endpoint, json_data=json_data)
+        return response.json() if response.content else {}
+
+    def delete(self, endpoint: str, json_data: Optional[Dict] = None) -> Dict:
+        """Make DELETE request"""
+        response = self._request("DELETE", endpoint, json_data=json_data)
+        return response.json() if response.content else {}
 
 
 # ============================================================================
@@ -489,11 +383,13 @@ def parse_query(query_str: Optional[str], base_query: Optional[Dict] = None,
     Examples:
         "priority >= 5 status == active tags in [work,urgent]"
         "created > 2024-01-01 assigned != none"
+        
+    This demonstrates:
+    - Custom DSL parsing
+    - Regular expressions for complex pattern matching
+    - Query builder pattern
+    - Type coercion and validation
     """
-    # Handle list input first
-    if isinstance(query_str, list):
-        query_str = " ".join(query_str)
-    
     if query_str is None or not query_str.strip():
         return base_query or {}
     
@@ -501,6 +397,9 @@ def parse_query(query_str: Optional[str], base_query: Optional[Dict] = None,
     field_aliases = field_aliases or {}
     field_multipliers = field_multipliers or {}
     valid_fields = valid_fields or set()
+    
+    if isinstance(query_str, list):
+        query_str = " ".join(query_str)
     
     query_str = query_str.strip()
     
@@ -586,7 +485,14 @@ def parse_query(query_str: Optional[str], base_query: Optional[Dict] = None,
 # ============================================================================
 
 class Cache:
-    """Simple file-based cache with time-based expiration."""
+    """
+    Simple file-based cache with expiration.
+    
+    Demonstrates:
+    - File I/O with JSON serialization
+    - Time-based cache invalidation
+    - Error handling for file operations
+    """
     
     def __init__(self, cache_file: str, duration: timedelta):
         self.cache_file = cache_file
@@ -638,7 +544,14 @@ class Cache:
 # ============================================================================
 
 class Config:
-    """Configuration file management."""
+    """
+    Configuration file management with XDG directory support.
+    
+    Demonstrates:
+    - Configuration file handling
+    - Default value management
+    - Secure API key storage
+    """
     
     def __init__(self, config_file: str):
         self.config_file = config_file
@@ -683,7 +596,23 @@ class Config:
 
 def execute_concurrent(func, items: List, max_workers: int = 8, 
                        max_retries: int = 3) -> List:
-    """Execute function concurrently on multiple items with retry logic."""
+    """
+    Execute function concurrently on multiple items with retry logic.
+    
+    Demonstrates:
+    - ThreadPoolExecutor for parallel execution
+    - Retry logic with exponential backoff
+    - Error handling in concurrent context
+    
+    Args:
+        func: Function to execute on each item
+        items: List of items to process
+        max_workers: Maximum number of concurrent workers
+        max_retries: Maximum retry attempts per item
+        
+    Returns:
+        List of results
+    """
     results = []
     
     def worker_with_retry(item):
@@ -717,7 +646,18 @@ def execute_concurrent(func, items: List, max_workers: int = 8,
 # ============================================================================
 
 def display_table(rows: List[Dict], fields: Tuple[Tuple[str, str, str, Any, bool], ...]):
-    """Display data in formatted table."""
+    """
+    Display data in formatted table.
+    
+    Args:
+        rows: List of data dictionaries
+        fields: Tuple of (key, display_name, format_str, transform_func, left_justify)
+        
+    Demonstrates:
+    - Formatted output generation
+    - Dynamic column width calculation
+    - Data transformation pipeline
+    """
     if not rows:
         print("No results found.")
         return
@@ -781,31 +721,37 @@ def deindent(text: str) -> str:
 
 # Initialize global parser
 parser = CommandParserWrapper(
-    description="CloudTask CLI - Local Task Management System",
+    description="CloudTask CLI - Professional Task Management System",
     epilog="Use 'cloudtask COMMAND --help' for more information about a command",
     formatter_class=CustomHelpFormatter
 )
 
 # Global arguments
+parser.add_argument("--api-key", help="API key for authentication", type=str)
+parser.add_argument("--url", help="API base URL", type=str, default=API_BASE_URL)
 parser.add_argument("--raw", help="Output raw JSON", action="store_true")
-parser.add_argument("--explain", help="Show query details without executing", action="store_true")
-parser.add_argument("--verbose", "-v", help="Enable verbose logging", action="store_true")
+parser.add_argument("--explain", help="Show request details without executing", action="store_true")
 
-# Global database backend instance
-db_backend: Optional[SQLiteBackend] = None
+# Global API client instance
+api_client: Optional[APIClient] = None
 
 
-def get_backend(args: argparse.Namespace) -> SQLiteBackend:
-    """Get or create database backend instance."""
-    global db_backend
+def get_api_client(args: argparse.Namespace) -> APIClient:
+    """Get or create API client instance"""
+    global api_client
     
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
+    api_key = args.api_key
+    if not api_key and os.path.exists(API_KEY_FILE):
+        try:
+            with open(API_KEY_FILE, 'r') as f:
+                api_key = f.read().strip()
+        except IOError:
+            pass
     
-    if not db_backend:
-        db_backend = SQLiteBackend(DB_FILE)
+    if not api_client or api_client.api_key != api_key:
+        api_client = APIClient(args.url, api_key)
     
-    return db_backend
+    return api_client
 
 
 # ============================================================================
@@ -842,17 +788,20 @@ TASK_DISPLAY_FIELDS = (
     argument("--tags", help="Comma-separated tags", type=str),
     argument("--due-date", help="Due date (YYYY-MM-DD)", type=str),
     argument("--assigned-to", help="Assign to user", type=str),
-    argument("--status", help="Task status", type=str, default="pending"),
     help="Create a new task"
 )
 def create__task(args: argparse.Namespace):
-    """Create a new task."""
-    backend = get_backend(args)
+    """
+    Create a new task in the system.
+    
+    Example:
+        cloudtask create task --title "Complete report" --priority 8 --tags "work,urgent"
+    """
+    client = get_api_client(args)
     
     task_data = {
         "title": args.title,
         "priority": args.priority,
-        "status": args.status,
     }
     
     if args.description:
@@ -860,13 +809,7 @@ def create__task(args: argparse.Namespace):
     if args.tags:
         task_data["tags"] = [t.strip() for t in args.tags.split(",")]
     if args.due_date:
-        try:
-            # Convert date string to Unix timestamp
-            due_dt = datetime.strptime(args.due_date, "%Y-%m-%d")
-            task_data["due_date"] = due_dt.timestamp()
-        except ValueError:
-            print(f"Error: Invalid date format. Use YYYY-MM-DD", file=sys.stderr)
-            sys.exit(1)
+        task_data["due_date"] = args.due_date
     if args.assigned_to:
         task_data["assigned_to"] = args.assigned_to
     
@@ -876,13 +819,11 @@ def create__task(args: argparse.Namespace):
         return
     
     try:
-        result = backend.create_task(task_data)
+        result = client.post("/tasks", task_data)
         if args.raw:
             print(json.dumps(result, indent=2))
         else:
-            print(f"✓ Task created successfully: ID {result.get('id')}")
-            print(f"  Title: {result.get('title')}")
-            print(f"  Priority: {result.get('priority')}")
+            print(f"Task created successfully: ID {result.get('id')}")
     except CloudTaskException as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -897,7 +838,7 @@ def create__task(args: argparse.Namespace):
         Query Examples:
             cloudtask search tasks "priority >= 7 status == active"
             cloudtask search tasks "tags in [work,urgent] assigned_to != none"
-            cloudtask search tasks "priority >= 5"
+            cloudtask search tasks "created > 2024-01-01"
             
         Available Fields:
             id, title, description, status, priority, tags,
@@ -908,8 +849,8 @@ def create__task(args: argparse.Namespace):
     """)
 )
 def search__tasks(args: argparse.Namespace):
-    """Search for tasks with complex filtering."""
-    backend = get_backend(args)
+    """Search for tasks with complex filtering"""
+    client = get_api_client(args)
     
     try:
         # Parse query
@@ -931,16 +872,13 @@ def search__tasks(args: argparse.Namespace):
             print(json.dumps(query, indent=2))
             return
         
-        tasks = backend.search_tasks(query)
+        result = client.post("/tasks/search", query)
         
         if args.raw:
-            print(json.dumps(tasks, indent=2))
+            print(json.dumps(result, indent=2))
         else:
-            if not tasks:
-                print("No tasks found.")
-            else:
-                display_table(tasks, TASK_DISPLAY_FIELDS)
-                print(f"\nFound {len(tasks)} task(s)")
+            tasks = result.get("tasks", [])
+            display_table(tasks, TASK_DISPLAY_FIELDS)
             
     except (ValueError, CloudTaskException) as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -952,23 +890,19 @@ def search__tasks(args: argparse.Namespace):
     help="Delete a task"
 )
 def delete__task(args: argparse.Namespace):
-    """Delete a task by ID."""
-    backend = get_backend(args)
+    """Delete a task by ID"""
+    client = get_api_client(args)
     
     if args.explain:
         print(f"Would delete task {args.task_id}")
         return
     
     try:
-        # Check if task exists first
-        task = backend.get_task(args.task_id)
-        if not task:
-            print(f"Error: Task {args.task_id} not found", file=sys.stderr)
-            sys.exit(1)
-        
-        backend.delete_task(args.task_id)
-        print(f"✓ Task {args.task_id} deleted successfully")
-        print(f"  Title: {task.get('title')}")
+        result = client.delete(f"/tasks/{args.task_id}")
+        if args.raw:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Task {args.task_id} deleted successfully")
     except CloudTaskException as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -981,8 +915,12 @@ def delete__task(args: argparse.Namespace):
     help="Batch update multiple tasks"
 )
 def update__tasks(args: argparse.Namespace):
-    """Update multiple tasks concurrently."""
-    backend = get_backend(args)
+    """
+    Update multiple tasks concurrently.
+    
+    Demonstrates concurrent operations with ThreadPoolExecutor.
+    """
+    client = get_api_client(args)
     
     update_data = {}
     if args.status:
@@ -991,7 +929,7 @@ def update__tasks(args: argparse.Namespace):
         update_data["priority"] = args.priority
     
     if not update_data:
-        print("Error: Provide at least one field to update (--status or --priority)", file=sys.stderr)
+        print("Error: Provide at least one field to update", file=sys.stderr)
         sys.exit(1)
     
     if args.explain:
@@ -1001,13 +939,12 @@ def update__tasks(args: argparse.Namespace):
     
     def update_task(task_id: int):
         try:
-            result = backend.update_task(task_id, update_data.copy())
-            return f"✓ Task {task_id}: Updated successfully"
+            result = client.put(f"/tasks/{task_id}", update_data)
+            return f"Task {task_id}: Success"
         except CloudTaskException as e:
-            return f"✗ Task {task_id}: {e}"
+            return f"Task {task_id}: Error - {e}"
     
     # Execute updates concurrently
-    print(f"Updating {len(args.task_ids)} task(s)...")
     results = execute_concurrent(update_task, args.task_ids, max_workers=8)
     
     for result in results:
@@ -1015,45 +952,55 @@ def update__tasks(args: argparse.Namespace):
 
 
 @parser.command(
+    argument("--key", help="API key", type=str, required=True),
+    help="Set API key for authentication"
+)
+def set__api_key(args: argparse.Namespace):
+    """Save API key to configuration file"""
+    try:
+        with open(API_KEY_FILE, 'w') as f:
+            f.write(args.api_key)
+        os.chmod(API_KEY_FILE, 0o600)  # Secure permissions
+        print(f"API key saved to {API_KEY_FILE}")
+    except IOError as e:
+        print(f"Error: Failed to save API key: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+@parser.command(
     help="Show current configuration"
 )
 def show__config(args: argparse.Namespace):
-    """Display current configuration."""
+    """Display current configuration"""
     config = Config(CONFIG_FILE)
     
-    print("CloudTask CLI Configuration:")
+    print("Configuration:")
     print(f"  Config file: {CONFIG_FILE}")
-    print(f"  Database: {DB_FILE}")
-    print(f"  Log file: {LOG_FILE}")
-    
-    # Show database stats
-    try:
-        backend = get_backend(args)
-        tasks = backend.search_tasks({"limit": 10000})
-        print(f"\nDatabase Statistics:")
-        print(f"  Total tasks: {len(tasks)}")
-        
-        status_counts = {}
-        for task in tasks:
-            status = task.get('status', 'unknown')
-            status_counts[status] = status_counts.get(status, 0) + 1
-        
-        for status, count in sorted(status_counts.items()):
-            print(f"  {status}: {count}")
-    except Exception as e:
-        print(f"  Error reading database: {e}", file=sys.stderr)
+    print(f"  API key file: {API_KEY_FILE}")
+    print(f"  Cache file: {CACHE_FILE}")
+    print(f"  API URL: {args.url}")
+    print(f"\nAPI Key: {'Set' if os.path.exists(API_KEY_FILE) else 'Not set'}")
+
+
+@parser.command(
+    help="Clear cache"
+)
+def clear__cache(args: argparse.Namespace):
+    """Clear the application cache"""
+    cache = Cache(CACHE_FILE, CACHE_DURATION)
+    cache.clear()
+    print("Cache cleared successfully")
 
 
 @parser.command(
     help="Show version information"
 )
 def version(args: argparse.Namespace):
-    """Display version and system information."""
+    """Display version and system information"""
     print(f"CloudTask CLI v{VERSION}")
     print(f"Python: {sys.version}")
-    print(f"Database: {DB_FILE}")
     print(f"Config directory: {DIRS['config']}")
-    print(f"Data directory: {DIRS['data']}")
+    print(f"Cache directory: {DIRS['cache']}")
 
 
 # ============================================================================
@@ -1069,12 +1016,7 @@ def main():
         print("\nInterrupted by user", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
-        import traceback
         print(f"Unexpected error: {e}", file=sys.stderr)
-        if hasattr(args, 'verbose') and args.verbose:
-            traceback.print_exc()
-        else:
-            logger.debug(traceback.format_exc())
         sys.exit(1)
 
 

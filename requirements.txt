@@ -1,2 +1,1 @@
-# CloudTask CLI has no external dependencies
-# Everything uses Python standard library (sqlite3, argparse, json, etc.)
+requests>=2.31.0
