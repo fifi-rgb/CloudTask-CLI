@@ -1,7 +1,5 @@
 """
-Example usage scripts for CloudTask CLI
-
-This file demonstrates various ways to use the CLI and its advanced features.
+Usage examples for CloudTask CLI
 """
 
 # ============================================================================
@@ -23,7 +21,7 @@ python cloudtask.py create task \
     --priority 7 \
     --tags "frontend,dashboard,high-priority" \
     --due-date "2026-03-01" \
-    --assigned-to "alice@example.com"
+    --assigned-to "dev@company.com"
 """
 
 # ============================================================================
@@ -58,7 +56,7 @@ python cloudtask.py search tasks "created >= 2026-01-01 created < 2026-02-01"
 # Complex multi-field query
 """
 python cloudtask.py search tasks \
-    "priority >= 7 status == active tags in [work,urgent] assigned_to == john@example.com"
+    "priority >= 7 status == active tags in [work,urgent] assigned_to == dev@company.com"
 """
 
 # Search with custom ordering

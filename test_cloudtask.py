@@ -1,7 +1,5 @@
 """
 Tests for CloudTask CLI
-
-This demonstrates how the architecture is testable and production-ready.
 """
 
 import unittest

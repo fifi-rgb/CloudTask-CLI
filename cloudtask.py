@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CloudTask CLI - A Professional Task Management System with Cloud Sync
+CloudTask CLI - Task Management with Cloud Sync
 """
 
 import argparse
@@ -31,7 +31,7 @@ try:
         'cache': xdg.xdg_cache_home()
     }
 except ImportError:
-    # Reasonable defaults for systems without xdg
+    # Fallback for systems without xdg
     DIRS = {
         'config': os.path.join(os.path.expanduser('~'), '.config'),
         'cache': os.path.join(os.path.expanduser('~'), '.cache'),
@@ -52,7 +52,7 @@ CACHE_FILE = os.path.join(DIRS['cache'], "task_cache.json")
 CACHE_DURATION = timedelta(minutes=15)
 
 # Default API endpoint
-API_BASE_URL = os.getenv("CLOUDTASK_URL", "https://api.cloudtask.example.com")
+API_BASE_URL = os.getenv("CLOUDTASK_URL", "https://api.cloudtask.io")
 
 
 # ============================================================================
@@ -95,10 +95,7 @@ class CustomHelpFormatter(argparse.RawTextHelpFormatter):
 
 class CommandParserWrapper:
     """
-    Custom argument parser wrapper that enables decorator-based command registration.
-    
-    This pattern allows for clean, maintainable CLI command definitions using
-    Python decorators rather than imperative parser configuration.
+    Argument parser wrapper enabling decorator-based command registration.
     """
     
     def __init__(self, *args, **kwargs):
@@ -264,11 +261,8 @@ class APIClient:
     """
     REST API client with retry logic, exponential backoff, and authentication.
     
-    Demonstrates:
-    - HTTP request handling with proper error management
-    - Retry logic with exponential backoff
-    - Bearer token authentication
-    - JSON serialization/deserialization
+    Features retry logic with exponential backoff, bearer token auth, and proper
+    timeout handling for resilient API communication.
     """
     
     def __init__(self, base_url: str, api_key: Optional[str] = None, 
@@ -383,12 +377,6 @@ def parse_query(query_str: Optional[str], base_query: Optional[Dict] = None,
     Examples:
         "priority >= 5 status == active tags in [work,urgent]"
         "created > 2024-01-01 assigned != none"
-        
-    This demonstrates:
-    - Custom DSL parsing
-    - Regular expressions for complex pattern matching
-    - Query builder pattern
-    - Type coercion and validation
     """
     if query_str is None or not query_str.strip():
         return base_query or {}
@@ -486,12 +474,7 @@ def parse_query(query_str: Optional[str], base_query: Optional[Dict] = None,
 
 class Cache:
     """
-    Simple file-based cache with expiration.
-    
-    Demonstrates:
-    - File I/O with JSON serialization
-    - Time-based cache invalidation
-    - Error handling for file operations
+    File-based cache with time-based expiration.
     """
     
     def __init__(self, cache_file: str, duration: timedelta):
@@ -546,11 +529,6 @@ class Cache:
 class Config:
     """
     Configuration file management with XDG directory support.
-    
-    Demonstrates:
-    - Configuration file handling
-    - Default value management
-    - Secure API key storage
     """
     
     def __init__(self, config_file: str):
@@ -598,11 +576,6 @@ def execute_concurrent(func, items: List, max_workers: int = 8,
                        max_retries: int = 3) -> List:
     """
     Execute function concurrently on multiple items with retry logic.
-    
-    Demonstrates:
-    - ThreadPoolExecutor for parallel execution
-    - Retry logic with exponential backoff
-    - Error handling in concurrent context
     
     Args:
         func: Function to execute on each item
@@ -652,11 +625,6 @@ def display_table(rows: List[Dict], fields: Tuple[Tuple[str, str, str, Any, bool
     Args:
         rows: List of data dictionaries
         fields: Tuple of (key, display_name, format_str, transform_func, left_justify)
-        
-    Demonstrates:
-    - Formatted output generation
-    - Dynamic column width calculation
-    - Data transformation pipeline
     """
     if not rows:
         print("No results found.")

@@ -53,7 +53,7 @@ python cloudtask.py create task \
   --priority 9 \
   --tags "development,urgent" \
   --due-date "2026-02-15" \
-  --assigned-to "john@example.com"
+  --assigned-to "dev@company.com"
 ```
 
 ### Search with query DSL
